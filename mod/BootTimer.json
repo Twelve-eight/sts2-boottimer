@@ -1,0 +1,12 @@
+{
+  "id": "BootTimer",
+  "name": "BootTimer",
+  "author": "omp",
+  "description": "Diagnostic: logs wall-clock timestamps at every boot milestone (mod init, per-mod load, loc, menu) to pinpoint startup stalls. Remove when done.",
+  "version": "0.1.0",
+  "min_game_version": "0.111.0",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false
+}
