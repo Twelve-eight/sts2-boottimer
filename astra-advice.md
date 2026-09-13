@@ -1,3 +1,7 @@
+## 第二轮复审 (2026-09-13)
+
+当前隔离构建 exit 0, 1 warning/0 error. 本轮没有重启游戏或运行新的计时会话; 保留 BootTimer 作为观测工具, 不将其他项目的当前 live log 误当作本项目性能复验. 任何启动数字仍须注明计时器加载点,冷/暖缓存和完整 mod 顺序.
+
 # Astra advice - BootTimer
 
 日期: 2026-09-12. 主会话单线. 本轮隔离构建 exit 0, 1 STS002 warning, 0 error; 已有真实游戏日志确实包含 START/END/主菜单时间戳. 没有本轮新游戏启动.
