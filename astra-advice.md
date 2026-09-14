@@ -1,6 +1,6 @@
-## 第二轮复审 (2026-09-13)
+## 第三轮复审 (2026-09-14)
 
-当前隔离构建 exit 0, 1 warning/0 error. 本轮没有重启游戏或运行新的计时会话; 保留 BootTimer 作为观测工具, 不将其他项目的当前 live log 误当作本项目性能复验. 任何启动数字仍须注明计时器加载点,冷/暖缓存和完整 mod 顺序.
+当前隔离构建 exit 0, 1 warning/0 error. 本轮没有新进程计时; BootTimer 仍只覆盖自身初始化之后的 `TryLoadMod` 调用,不能覆盖前置模组和更早的引擎启动成本. 继续要求每份性能结论绑定 BootTimer 加载位置, mod 顺序和 cold/warm 状态.
 
 # Astra advice - BootTimer
 
