@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 
 using Godot;
 
@@ -30,9 +31,11 @@ namespace BootTimer.BootTimerCode;
 ///   never as zero.
 /// - Success latches represent COMPLETED operations only. Failures are recorded as failures with
 ///   a bounded exception summary.
-/// - A Task returning is not asynchronous completion: the preload queue drain latch is armed by a
-///   continuation on the returned session Task, so it fires on real completion (success, fault or
-///   cancel), and its thread identity is recorded.
+/// - Preload observation has two separate contracts: "preload-observed-sessions-idle" is only a
+///   snapshot that every observed session reached a terminal Task state. The stronger
+///   "preload-producer-closed-and-idle" milestone is emitted only after an explicit owner fence
+///   proves that no later producer submission can occur and the tracked outstanding count is zero.
+///   Neither milestone claims that every optional preload path succeeded.
 ///
 /// Config: diagnostics are enabled by default. Setting the environment variable BOOTTIMER_DIAG to
 /// "0" or "false" (case-insensitive) disables everything: no Harmony patches are installed at all,
@@ -165,7 +168,8 @@ internal static class BootDiag
         ("regentfx-loadscenes", "LoadScenes was not invoked by summary time (Setting.PreloadEffects=false, suppressed by RegentFXFastBoot, RegentFX absent, or hook binding failed - see hooks line)"),
         ("regentfx-asset-collector", "CollectAssetPathsSafely was not invoked (it only runs inside LoadScenes)"),
         ("main-menu-visible", "main menu was not reached by summary time"),
-        ("preload-queue-drained", "no NAssetLoader background session was both submitted and completed after the observer installed; sessions submitted earlier are unobserved, not zero"),
+        ("preload-observed-sessions-idle", "no observed NAssetLoader session reached terminal state after the observer installed; this is not global completion"),
+        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion"),
         ("first-effect-scene-load", "no lazy engine-cache fetch (AssetCache.GetScene/GetAsset) inside a RegentFX invocation context was observed; with a working preload the per-scene load cost is folded into the regentfx-loadscenes span"),
         ("first-effect-instantiate", "no node instantiation via the non-generic GenVFXNode(string) overload was observed; generic GenVFXNode<T> callers cannot be patched (open generic) - see hooks line"),
         ("first-combat-room-ready", "no NCombatRoom became ready by summary time"),
@@ -621,6 +625,7 @@ internal static class BootDiag
                      + " spans_overflow=" + _spansOverflow.ToString(CultureInfo.InvariantCulture)
                      + " summary_write=" + _summaryWrites.ToString(CultureInfo.InvariantCulture));
                 Emit("[BootTimer][SUMMARY] coverage=\"ticks are Stopwatch.GetTimestamp values; phases before install_tick are unobserved (null), never zero; UTC is correlation only\"");
+                Emit(PreloadSubmitPatch.SummaryLine());
 
                 foreach (var (name, reason) in ExpectedMilestones)
                 {
@@ -910,28 +915,55 @@ internal static class CombatRoomReadyPatch
 }
 
 /// <summary>
-/// Hook: NAssetLoader.LoadInTheBackground - preload queue observation.
+/// Hook: NAssetLoader.LoadInTheBackground - observed preload-session accounting.
 ///
 /// Producer: engine NAssetLoader; each call enqueues one AssetLoadingSession into the background
 ///   preload queue.
-/// Owner: BootTimer. First consumer: "preload-queue-drained" milestone.
-/// Completion semantics (hard requirement): the Task RETURN is not asynchronous completion. The
-///   drain latch is armed by a continuation on the returned session Task, so it fires when the
-///   session ACTUALLY completes (success, fault or cancellation), on whatever thread the
-///   continuation runs; both the submit thread and the completion thread are recorded.
-/// Late observation honesty: only sessions submitted after this patch installed are counted;
-///   sessions submitted earlier are unobserved with that reason, never zero.
+/// Owner: BootTimer. First consumer: "preload-observed-sessions-idle" milestone.
+/// Completion semantics: the Task RETURN is not asynchronous completion. The observer attaches a
+///   continuation to the returned session Task and records a session only when it reaches a terminal
+///   state (success, fault or cancellation).
+/// Global completion boundary: NAssetLoader exposes no producer-closed signal. Therefore an
+///   outstanding count of zero is recorded only as a sampled idle point for sessions observed by this
+///   probe. It is never named or logged as global preload completion. A later submission records a
+///   reopened marker and starts a new observed epoch.
 /// Cleanup point: each continuation holds only its own session until completion; the outstanding
-///   counter is Interlocked-maintained; first-wins latch; no per-frame work.
+///   counter and epoch state are protected by one short StateGate critical section; all state is O(1) apart from the bounded
+///   BootDiag record store.
 /// </summary>
 [HarmonyPatch(typeof(NAssetLoader), nameof(NAssetLoader.LoadInTheBackground))]
-internal static class PreloadSubmitPatch
+public static class PreloadSubmitPatch
 {
-    private static int _outstanding;       // observed sessions submitted but not yet completed
-    private static int _observedSessions;
+    private const int MaxNameLen = 96;
+    private const int MaxProducerNameLen = 64;
+    private static readonly object StateGate = new();
+
+    // O(1) state only. Counters saturate instead of wrapping; no session collection is retained.
+    private static long _outstanding;
+    private static long _observedSessions;
+    private static long _submissionEpoch;
+    private static long _idleEpochs;
+    private static long _reopenCount;
+    private static long _lateSubmissionCount;
+    private static long _underflowCount;
     private static long _firstSubmitTick;
     private static int _firstSubmitThread;
-    private static int _drainLatched;
+    private static long _epochFirstSubmitTick;
+    private static int _epochFirstSubmitThread;
+    private static long _producerClosedTick;
+    private static int _producerClosedThread;
+    private static long _lastIdleTick;
+    private static int _lastIdleThread;
+    private static bool _producerClosed;
+    private static bool _completionLatched;
+    private static bool _contractViolation;
+    private static bool _trackingBroken;
+    private static bool _observedIdleMilestoneLatched;
+    private static bool _reopenMarkerEmitted;
+    private static bool _lateSubmissionMarkerEmitted;
+    private static bool _trackingFailureMarkerEmitted;
+    private static bool _closeConflictMarkerEmitted;
+    private static string _producerName = "";
 
     private static void Finalizer(Exception __exception, AssetLoadingSession session, Task<bool>? __result)
     {
@@ -951,59 +983,453 @@ internal static class PreloadSubmitPatch
 
             long submitTick = Stopwatch.GetTimestamp();
             int submitThread = System.Environment.CurrentManagedThreadId;
-            int index = Interlocked.Increment(ref _observedSessions);
-            Interlocked.Increment(ref _outstanding);
-            Interlocked.CompareExchange(ref _firstSubmitTick, submitTick, 0);
-            Interlocked.CompareExchange(ref _firstSubmitThread, submitThread, 0);
-            BootDiag.RecordMarker("preload-session-submitted", "index=" + index + " session=" + SessionName(session));
+            string sessionName = NormalizeName(SessionName(session), MaxNameLen);
+            long index;
+            long epoch;
+            bool reopened;
+            bool lateSubmission;
+            bool violationMarker;
 
-            __result.ContinueWith(t =>
+            lock (StateGate)
             {
-                try
-                {
-                    long doneTick = Stopwatch.GetTimestamp();
-                    int remaining = Interlocked.Decrement(ref _outstanding);
-                    bool completedOk = t.Status == TaskStatus.RanToCompletion;
-                    Exception? err = t.IsFaulted ? t.Exception?.GetBaseException() : null;
-                    BootDiag.RecordSpan(
-                        "preload-session", "span", null, submitTick, doneTick, completedOk, err,
-                        "index=" + index + " session=" + SessionName(session)
-                        + " task_status=" + t.Status + " remaining=" + remaining,
-                        submitThread);
+                index = IncrementSaturated(ref _observedSessions);
+                reopened = false;
+                lateSubmission = false;
+                violationMarker = false;
 
-                    if (remaining != 0)
+                if (_outstanding == 0)
+                {
+                    if (_idleEpochs > 0)
                     {
-                        return;
+                        IncrementSaturated(ref _reopenCount);
+                        reopened = true;
                     }
 
-                    if (Interlocked.CompareExchange(ref _drainLatched, 1, 0) == 0)
-                    {
-                        long first = Interlocked.Read(ref _firstSubmitTick);
-                        BootDiag.RecordSpan(
-                            "preload-queue", "span", null, first, doneTick, true, null,
-                            "observed_sessions=" + index
-                            + "; sessions submitted before the observer installed are unobserved, not zero",
-                            _firstSubmitThread);
-                        BootDiag.LatchMilestone(
-                            "preload-queue-drained", null, first, doneTick, true, null,
-                            "all observed background sessions completed; observed_sessions=" + index,
-                            _firstSubmitThread);
-                    }
-                    else
-                    {
-                        BootDiag.RecordMarker("preload-queue-redrained", "queue emptied again after the first drain latch");
-                    }
+                    IncrementSaturated(ref _submissionEpoch);
+                    _epochFirstSubmitTick = submitTick;
+                    _epochFirstSubmitThread = submitThread;
                 }
-                catch (Exception e)
+
+                if (_firstSubmitTick == 0)
                 {
-                    BootDiag.RecordFailure("preload-session-continuation-failed", e, null);
+                    _firstSubmitTick = submitTick;
+                    _firstSubmitThread = submitThread;
                 }
-            }, TaskScheduler.Default);
+
+                if (_producerClosed)
+                {
+                    IncrementSaturated(ref _lateSubmissionCount);
+                    _contractViolation = true;
+                    lateSubmission = true;
+                    if (!_lateSubmissionMarkerEmitted)
+                    {
+                        _lateSubmissionMarkerEmitted = true;
+                        violationMarker = true;
+                    }
+                }
+
+                if (_outstanding == long.MaxValue)
+                {
+                    _trackingBroken = true;
+                    _contractViolation = true;
+                    if (!_trackingFailureMarkerEmitted)
+                    {
+                        _trackingFailureMarkerEmitted = true;
+                        violationMarker = true;
+                    }
+                }
+                else
+                {
+                    _outstanding++;
+                }
+
+                epoch = _submissionEpoch;
+            }
+
+            BootDiag.RecordMarker(
+                "preload-session-submitted",
+                "index=" + index.ToString(CultureInfo.InvariantCulture)
+                + " epoch=" + epoch.ToString(CultureInfo.InvariantCulture)
+                + " session=" + sessionName);
+
+            if (reopened && TakeReopenMarker())
+            {
+                BootDiag.RecordMarker(
+                    "preload-observed-sessions-reopened",
+                    "a new session arrived after an observed idle epoch; later submissions are outside the first idle snapshot");
+            }
+
+            if (violationMarker)
+            {
+                string reason = lateSubmission
+                    ? "producer submitted after the explicit close fence; closed-and-idle completion is invalid"
+                    : "observed session counter saturated; completion is disabled";
+                BootDiag.RecordFailure("preload-producer-contract-violated", new InvalidOperationException(reason), null);
+            }
+
+            try
+            {
+                __result.ContinueWith(
+                    t => CompleteSession(t, submitTick, submitThread, index, epoch, sessionName),
+                    TaskScheduler.Default);
+            }
+            catch (Exception e)
+            {
+                lock (StateGate)
+                {
+                    _trackingBroken = true;
+                    _contractViolation = true;
+                }
+                BootDiag.RecordFailure("preload-session-continuation-registration-failed", e, "session=" + sessionName);
+            }
         }
         catch (Exception e)
         {
+            lock (StateGate)
+            {
+                _trackingBroken = true;
+                _contractViolation = true;
+            }
             BootDiag.RecordFailure("preload-submit-finalizer-failed", e, null);
         }
+    }
+
+    /// <summary>
+    /// Explicit producer fence for a cooperating owner. The caller must own every producer
+    /// represented by this observer, call this after BootTimer installation, and guarantee that no
+    /// later LoadInTheBackground call is possible. Closure is not inferred from queue state.
+    /// Without this call, only the observed-sessions-idle milestone can be emitted.
+    /// </summary>
+    public static bool MarkProducerClosed(string producer, string? note = null)
+    {
+        if (!BootDiag.Enabled)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(producer))
+        {
+            BootDiag.RecordFailure(
+                "preload-producer-close-invalid",
+                new ArgumentException("producer name is required", nameof(producer)),
+                note);
+            return false;
+        }
+
+        string producerName = NormalizeName(producer, MaxProducerNameLen);
+        long closeTick = Stopwatch.GetTimestamp();
+        int closeThread = System.Environment.CurrentManagedThreadId;
+        bool accepted = false;
+        bool conflict = false;
+        bool conflictMarker = false;
+        bool completion = false;
+        long completionStartTick = 0;
+        int completionStartThread = 0;
+        string completionNote = "";
+        long observedAtClose = 0;
+        long outstandingAtClose = 0;
+        string firstProducerName = "";
+
+        lock (StateGate)
+        {
+            if (_producerClosed)
+            {
+                firstProducerName = _producerName;
+                if (!string.Equals(_producerName, producerName, StringComparison.Ordinal))
+                {
+                    _contractViolation = true;
+                    conflict = true;
+                    if (!_closeConflictMarkerEmitted)
+                    {
+                        _closeConflictMarkerEmitted = true;
+                        conflictMarker = true;
+                    }
+                }
+            }
+            else
+            {
+                _producerClosed = true;
+                _producerName = producerName;
+                _producerClosedTick = closeTick;
+                _producerClosedThread = closeThread;
+                observedAtClose = _observedSessions;
+                outstandingAtClose = _outstanding;
+                accepted = true;
+                completion = TryTakeCompletionLocked(
+                    closeTick,
+                    closeThread,
+                    out completionStartTick,
+                    out completionStartThread,
+                    out completionNote);
+            }
+        }
+
+        if (accepted)
+        {
+            BootDiag.RecordMarker(
+                "preload-producer-closed",
+                "producer=" + producerName
+                + "; observed_sessions=" + observedAtClose.ToString(CultureInfo.InvariantCulture)
+                + "; outstanding=" + outstandingAtClose.ToString(CultureInfo.InvariantCulture)
+                + "; note=" + (note ?? "none"));
+        }
+
+        if (conflictMarker)
+        {
+            BootDiag.RecordFailure(
+                "preload-producer-contract-violated",
+                new InvalidOperationException("a second producer close fence was received for a different producer"),
+                "first=" + firstProducerName + "; second=" + producerName);
+        }
+
+        if (completion)
+        {
+            BootDiag.LatchMilestone(
+                "preload-producer-closed-and-idle",
+                null,
+                completionStartTick,
+                closeTick,
+                true,
+                null,
+                completionNote,
+                completionStartThread);
+        }
+
+        return accepted && !conflict;
+    }
+
+    private static void CompleteSession(
+        Task<bool> task,
+        long submitTick,
+        int submitThread,
+        long index,
+        long epoch,
+        string sessionName)
+    {
+        try
+        {
+            long doneTick = Stopwatch.GetTimestamp();
+            int doneThread = System.Environment.CurrentManagedThreadId;
+            long remaining;
+            bool firstIdle = false;
+            long idleEpoch = 0;
+            long idleStartTick = 0;
+            int idleStartThread = 0;
+            long observedAtIdle = 0;
+            bool trackingMarker = false;
+            long underflowAtFailure = 0;
+            bool completion = false;
+            long completionStartTick = 0;
+            int completionStartThread = 0;
+            string completionNote = "";
+
+            lock (StateGate)
+            {
+                if (_outstanding <= 0)
+                {
+                    IncrementSaturated(ref _underflowCount);
+                    underflowAtFailure = _underflowCount;
+                    _outstanding = 0;
+                    _trackingBroken = true;
+                    _contractViolation = true;
+                    if (!_trackingFailureMarkerEmitted)
+                    {
+                        _trackingFailureMarkerEmitted = true;
+                        trackingMarker = true;
+                    }
+                }
+                else
+                {
+                    _outstanding--;
+                }
+
+                remaining = _outstanding;
+                if (remaining == 0 && !_trackingBroken)
+                {
+                    idleEpoch = IncrementSaturated(ref _idleEpochs);
+                    _lastIdleTick = doneTick;
+                    _lastIdleThread = doneThread;
+                    idleStartTick = _epochFirstSubmitTick != 0 ? _epochFirstSubmitTick : submitTick;
+                    idleStartThread = _epochFirstSubmitThread != 0 ? _epochFirstSubmitThread : submitThread;
+                    observedAtIdle = _observedSessions;
+                    if (!_observedIdleMilestoneLatched)
+                    {
+                        _observedIdleMilestoneLatched = true;
+                        firstIdle = true;
+                    }
+
+                    completion = TryTakeCompletionLocked(
+                        doneTick,
+                        doneThread,
+                        out completionStartTick,
+                        out completionStartThread,
+                        out completionNote);
+                }
+            }
+
+            bool completedOk = task.Status == TaskStatus.RanToCompletion;
+            Exception? err = task.IsFaulted ? task.Exception?.GetBaseException() : null;
+            BootDiag.RecordSpan(
+                "preload-session",
+                "span",
+                null,
+                submitTick,
+                doneTick,
+                completedOk,
+                err,
+                "index=" + index.ToString(CultureInfo.InvariantCulture)
+                + " epoch=" + epoch.ToString(CultureInfo.InvariantCulture)
+                + " session=" + sessionName
+                + " task_status=" + task.Status
+                + " remaining=" + remaining.ToString(CultureInfo.InvariantCulture),
+                submitThread);
+
+            if (trackingMarker)
+            {
+                BootDiag.RecordFailure(
+                    "preload-tracking-broken",
+                    new InvalidOperationException("observed session accounting lost its outstanding invariant"),
+                    "underflow=" + underflowAtFailure.ToString(CultureInfo.InvariantCulture));
+            }
+
+            if (firstIdle)
+            {
+                string idleNote =
+                    "idle_epoch=" + idleEpoch.ToString(CultureInfo.InvariantCulture)
+                    + "; observed_sessions=" + observedAtIdle.ToString(CultureInfo.InvariantCulture)
+                    + "; terminal_tasks_only=true; producer_close_not_observed";
+                BootDiag.RecordSpan(
+                    "preload-observed-sessions",
+                    "span",
+                    null,
+                    idleStartTick,
+                    doneTick,
+                    true,
+                    null,
+                    idleNote,
+                    idleStartThread);
+                BootDiag.LatchMilestone(
+                    "preload-observed-sessions-idle",
+                    null,
+                    idleStartTick,
+                    doneTick,
+                    true,
+                    null,
+                    "observed sessions reached terminal Task state; this is a snapshot, not global preload completion"
+                    + "; idle_epoch=" + idleEpoch.ToString(CultureInfo.InvariantCulture),
+                    idleStartThread);
+            }
+
+            if (completion)
+            {
+                BootDiag.LatchMilestone(
+                    "preload-producer-closed-and-idle",
+                    null,
+                    completionStartTick,
+                    doneTick,
+                    true,
+                    null,
+                    completionNote,
+                    completionStartThread);
+            }
+        }
+        catch (Exception e)
+        {
+            lock (StateGate)
+            {
+                _trackingBroken = true;
+                _contractViolation = true;
+            }
+            BootDiag.RecordFailure("preload-session-continuation-failed", e, null);
+        }
+    }
+
+    private static bool TryTakeCompletionLocked(
+        long endTick,
+        int endThread,
+        out long startTick,
+        out int startThread,
+        out string note)
+    {
+        if (!_producerClosed || _completionLatched || _contractViolation || _outstanding != 0)
+        {
+            startTick = 0;
+            startThread = 0;
+            note = "";
+            return false;
+        }
+
+        _completionLatched = true;
+        startTick = _firstSubmitTick != 0 ? _firstSubmitTick : _producerClosedTick;
+        startThread = _firstSubmitThread != 0 ? _firstSubmitThread : _producerClosedThread;
+        if (startTick == 0)
+        {
+            startTick = endTick;
+            startThread = endThread;
+        }
+
+        note = "producer=" + _producerName
+               + "; producer_closed=true"
+               + "; observed_sessions=" + _observedSessions.ToString(CultureInfo.InvariantCulture)
+               + "; outstanding=0"
+               + "; explicit_close_fence=true"
+               + "; no_preload_success_claim";
+        return true;
+    }
+
+    private static bool TakeReopenMarker()
+    {
+        lock (StateGate)
+        {
+            if (_reopenMarkerEmitted)
+            {
+                return false;
+            }
+
+            _reopenMarkerEmitted = true;
+            return true;
+        }
+    }
+
+    internal static string SummaryLine()
+    {
+        lock (StateGate)
+        {
+            return "[BootTimer][SUMMARY] preload_contract"
+                   + " observed_sessions=" + _observedSessions.ToString(CultureInfo.InvariantCulture)
+                   + " outstanding=" + _outstanding.ToString(CultureInfo.InvariantCulture)
+                   + " submission_epochs=" + _submissionEpoch.ToString(CultureInfo.InvariantCulture)
+                   + " idle_epochs=" + _idleEpochs.ToString(CultureInfo.InvariantCulture)
+                   + " reopen_count=" + _reopenCount.ToString(CultureInfo.InvariantCulture)
+                   + " late_submissions=" + _lateSubmissionCount.ToString(CultureInfo.InvariantCulture)
+                   + " underflow=" + _underflowCount.ToString(CultureInfo.InvariantCulture)
+                   + " producer_closed=" + BoolString(_producerClosed)
+                   + " producer=\"" + _producerName + "\""
+                   + " contract_violated=" + BoolString(_contractViolation)
+                   + " tracking_broken=" + BoolString(_trackingBroken)
+                   + " completion_latched=" + BoolString(_completionLatched)
+                   + " last_idle_tick=" + _lastIdleTick.ToString(CultureInfo.InvariantCulture)
+                   + " last_idle_thread=" + _lastIdleThread.ToString(CultureInfo.InvariantCulture)
+                   + " note=\"observed idle is a snapshot; closed-and-idle requires an explicit producer fence\"";
+        }
+    }
+
+    private static long IncrementSaturated(ref long value)
+    {
+        if (value < long.MaxValue)
+        {
+            value++;
+        }
+
+        return value;
+    }
+
+    private static bool BoolString(bool value) => value ? "true" : "false";
+
+    private static string NormalizeName(string value, int maxLength)
+    {
+        string sanitized = value.Trim().Replace('\r', ' ').Replace('\n', ' ').Replace('"', '\'');
+        return sanitized.Length <= maxLength ? sanitized : sanitized.Substring(0, maxLength);
     }
 
     /// <summary>
@@ -1028,7 +1454,6 @@ internal static class PreloadSubmitPatch
         }
     }
 }
-
 /// <summary>
 /// Reflection binder for the RegentFX-specific hooks and the engine AssetCache scene-fetch hook.
 ///
