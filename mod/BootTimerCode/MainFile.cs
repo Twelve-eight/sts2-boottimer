@@ -1424,7 +1424,7 @@ public static class PreloadSubmitPatch
         return value;
     }
 
-    private static bool BoolString(bool value) => value ? "true" : "false";
+    private static string BoolString(bool value) => value ? "true" : "false";
 
     private static string NormalizeName(string value, int maxLength)
     {

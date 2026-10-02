@@ -2,7 +2,7 @@
   "id": "BootTimer",
   "name": "BootTimer",
   "author": "omp",
-  "description": "Diagnostic: logs wall-clock timestamps at every boot milestone (mod init, per-mod load, loc, menu) to pinpoint startup stalls. Remove when done.",
+  "description": "Diagnostic-only observer: logs monotonic boot milestones (mod init, per-mod load, loc, menu, preload sessions) to pinpoint startup stalls. Enabled by default; disabled only when BOOTTIMER_DIAG is exactly \"0\" (ordinal) or \"false\" (case-insensitive) - unset or any other value (for example 1, off, no) keeps it enabled. When enabled it installs observer-only Harmony hooks that record and log timings without mutating gameplay; when disabled it installs no patches and does no tracing. It registers no run content (no cards/relics/potions/events) and has no in-game settings page - the environment variable is the only switch. Remove when diagnosis is done.",
   "version": "0.1.0",
   "min_game_version": "0.111.0",
   "has_pck": false,
