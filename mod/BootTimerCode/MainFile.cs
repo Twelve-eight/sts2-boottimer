@@ -38,9 +38,10 @@ namespace BootTimer.BootTimerCode;
 ///   Neither milestone claims that every optional preload path succeeded.
 ///
 /// Config: diagnostics are enabled by default. Setting the environment variable BOOTTIMER_DIAG to
-/// "0" or "false" (case-insensitive) disables everything: no Harmony patches are installed at all,
-/// so there is no formatting, no sampling and no allocation on any path. The probe is read-only;
-/// the mod never writes settings, files or config.
+/// "0" or "false" (case-insensitive) disables everything: no Harmony patches are installed, and no
+/// per-frame work or per-event formatting happens. Two allocations still occur at startup, before
+/// the check: the latch message at :66-71 is built unconditionally, and one "diagnostics disabled"
+/// line is emitted. The probe is read-only; the mod never writes settings, files or config.
 ///
 /// Output:
 /// - Bounded trace: one "[BootTimer] ..." line per span/marker, capped per session (suppressed
@@ -169,7 +170,7 @@ internal static class BootDiag
         ("regentfx-asset-collector", "CollectAssetPathsSafely was not invoked (it only runs inside LoadScenes)"),
         ("main-menu-visible", "main menu was not reached by summary time"),
         ("preload-observed-sessions-idle", "no observed NAssetLoader session reached terminal state after the observer installed; this is not global completion"),
-        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion"),
+        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion. NOTE: in-tree nothing calls MarkProducerClosed(), so this line is unreachable unless a future consumer opts in"),
         ("first-effect-scene-load", "no lazy engine-cache fetch (AssetCache.GetScene/GetAsset) inside a RegentFX invocation context was observed; with a working preload the per-scene load cost is folded into the regentfx-loadscenes span"),
         ("first-effect-instantiate", "no node instantiation via the non-generic GenVFXNode(string) overload was observed; generic GenVFXNode<T> callers cannot be patched (open generic) - see hooks line"),
         ("first-combat-room-ready", "no NCombatRoom became ready by summary time"),
