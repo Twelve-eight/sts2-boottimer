@@ -170,7 +170,7 @@ internal static class BootDiag
         ("regentfx-asset-collector", "CollectAssetPathsSafely was not invoked (it only runs inside LoadScenes)"),
         ("main-menu-visible", "main menu was not reached by summary time"),
         ("preload-observed-sessions-idle", "no observed NAssetLoader session reached terminal state after the observer installed; this is not global completion"),
-        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion. NOTE: in-tree nothing calls MarkProducerClosed(), so this line is unreachable unless a future consumer opts in"),
+        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion"),
         ("first-effect-scene-load", "no lazy engine-cache fetch (AssetCache.GetScene/GetAsset) inside a RegentFX invocation context was observed; with a working preload the per-scene load cost is folded into the regentfx-loadscenes span"),
         ("first-effect-instantiate", "no node instantiation via the non-generic GenVFXNode(string) overload was observed; generic GenVFXNode<T> callers cannot be patched (open generic) - see hooks line"),
         ("first-combat-room-ready", "no NCombatRoom became ready by summary time"),
