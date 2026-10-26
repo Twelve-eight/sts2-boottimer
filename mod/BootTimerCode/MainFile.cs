@@ -31,11 +31,18 @@ namespace BootTimer.BootTimerCode;
 ///   never as zero.
 /// - Success latches represent COMPLETED operations only. Failures are recorded as failures with
 ///   a bounded exception summary.
-/// - Preload observation has two separate contracts: "preload-observed-sessions-idle" is only a
-///   snapshot that every observed session reached a terminal Task state. The stronger
-///   "preload-producer-closed-and-idle" milestone is emitted only after an explicit owner fence
-///   proves that no later producer submission can occur and the tracked outstanding count is zero.
-///   Neither milestone claims that every optional preload path succeeded.
+/// - Preload observation has three separate contracts, and the SESSION SET matters:
+///   (1) "preload-engine-sessions-idle" is the FIRST tick at which no observed non-optional
+///   (PreloadManager) session is outstanding. It is a snapshot of that one class: the engine
+///   reopens the queue after the main menu appears (deferred "Common" session,
+///   NGame.cs:1040-1041), so this milestone never means "boot loading finished".
+///   (2) "warmup-consumer-terminal" is RegentFXFastBoot's own terminal
+///   (MainFile.CompleteWarmUp) - the only boundary that means "the optional warm-up finished".
+///   It is latched by a reflection-bound patch and stays unobserved with a reason otherwise.
+///   (3) "preload-producer-closed-and-idle" is emitted only after an explicit owner fence proves
+///   that no later submission of the tracked producer set can occur and outstanding is zero.
+///   None of the three claims that every optional preload path succeeded: the per-class counters
+///   in the summary preload_contract line are the evidence for per-class outcome.
 ///
 /// Config: diagnostics are enabled by default. Setting the environment variable BOOTTIMER_DIAG to
 /// "0" or "false" (case-insensitive) disables everything: no Harmony patches are installed, and no
@@ -58,7 +65,7 @@ namespace BootTimer.BootTimerCode;
 public partial class MainFile : Node
 {
     public const string ModId = "BootTimer";
-    public const string ModVersion = "0.1.0"; // keep in sync with BootTimer.json
+    public const string ModVersion = "0.2.0"; // keep in sync with BootTimer.json
 
     public static void Initialize()
     {
@@ -102,9 +109,10 @@ public partial class MainFile : Node
         }
 
         RegentFxBinder.TryBind(harmony, "initializer");
+        FastBootBinder.TryBind(harmony, "initializer");
 
-        BootDiag.RecordMarker("hooks-installed", "engine attribute patches + RegentFX reflection binder armed");
-        BootDiag.Emit($"[{ModId}] hooks installed (inclusive TryLoadMod spans, isolated RegentFX LoadScenes/collector/GenVFXNode where bindable, menu/room/queue milestones; utc {DateTimeOffset.UtcNow:HH:mm:ss.fff})");
+        BootDiag.RecordMarker("hooks-installed", "engine attribute patches + RegentFX and FastBoot reflection binders armed");
+        BootDiag.Emit($"[{ModId}] hooks installed (inclusive TryLoadMod spans, isolated RegentFX LoadScenes/collector/GenVFXNode where bindable, menu/room/queue milestones, RegentFXFastBoot warm-up terminal where bindable; utc {DateTimeOffset.UtcNow:HH:mm:ss.fff})");
     }
 }
 
@@ -169,7 +177,8 @@ internal static class BootDiag
         ("regentfx-loadscenes", "LoadScenes was not invoked by summary time (Setting.PreloadEffects=false, suppressed by RegentFXFastBoot, RegentFX absent, or hook binding failed - see hooks line)"),
         ("regentfx-asset-collector", "CollectAssetPathsSafely was not invoked (it only runs inside LoadScenes)"),
         ("main-menu-visible", "main menu was not reached by summary time"),
-        ("preload-observed-sessions-idle", "no observed NAssetLoader session reached terminal state after the observer installed; this is not global completion"),
+        ("preload-engine-sessions-idle", "no observed non-optional (PreloadManager) session drained after the observer installed; a snapshot of that one class, never a boot-loading claim"),
+        ("warmup-consumer-terminal", "RegentFXFastBoot's CompleteWarmUp was not observed by summary time (FastBoot absent, hook not bound, the warm-up never reached a terminal, or no warm-up was scheduled this launch - see the hooks line)"),
         ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion"),
         ("first-effect-scene-load", "no lazy engine-cache fetch (AssetCache.GetScene/GetAsset) inside a RegentFX invocation context was observed; with a working preload the per-scene load cost is folded into the regentfx-loadscenes span"),
         ("first-effect-instantiate", "no node instantiation via the non-generic GenVFXNode(string) overload was observed; generic GenVFXNode<T> callers cannot be patched (open generic) - see hooks line"),
@@ -495,6 +504,14 @@ internal static class BootDiag
         }
     }
 
+    internal static string? HookState(string key)
+    {
+        lock (Gate)
+        {
+            return HookStates.TryGetValue(key, out var value) ? value : null;
+        }
+    }
+
     // ------------------------------------------------------------------
     // Trace emission (bounded) + shared key=value formatting
     // ------------------------------------------------------------------
@@ -679,6 +696,7 @@ internal static class BootDiag
                      "loadscenes", "collector", "genvfx_nongeneric", "genvfx_generic", "scenefetch",
                      "scenefetch_method", "regentfx_assembly", "fastboot_assembly",
                      "binding_attempts", "binding_last_trigger", "binding_terminal",
+                     "fastboot_binding", "fastboot_binding_attempts", "fastboot_terminal_hook",
                  })
         {
             if (HookStates.TryGetValue(key, out var v))
@@ -704,6 +722,7 @@ internal static class BootDiag
         }
 
         sb.Append(" modscene_cache_count=").Append(RegentFxBinder.ModSceneCacheCountString());
+        sb.Append(" fastboot_warmup=\"").Append(FastBootBinder.StateString()).Append('"');
         return sb.ToString();
     }
 }
@@ -781,6 +800,7 @@ internal static class TryLoadModPatch
                 if (harmony != null)
                 {
                     RegentFxBinder.TryBind(harmony, "tryloadmod:" + st.ModId);
+                    FastBootBinder.TryBind(harmony, "tryloadmod:" + st.ModId);
                 }
             }
         }
@@ -855,6 +875,7 @@ internal static class MainMenuReadyPatch
                 if (harmony != null)
                 {
                     RegentFxBinder.TryBind(harmony, "main-menu-visible");
+                    FastBootBinder.TryBind(harmony, "main-menu-visible");
                 }
 
                 BootDiag.WriteSummary("main-menu-visible");
@@ -918,16 +939,26 @@ internal static class CombatRoomReadyPatch
 /// <summary>
 /// Hook: NAssetLoader.LoadInTheBackground - observed preload-session accounting.
 ///
-/// Producer: engine NAssetLoader; each call enqueues one AssetLoadingSession into the background
-///   preload queue.
-/// Owner: BootTimer. First consumer: "preload-observed-sessions-idle" milestone.
+/// Producer: engine PreloadManager (boot/run asset sets) AND any third-party warm-up that submits
+///   through the engine (currently RegentFXFastBoot's optional per-path warm-up). Each call enqueues
+///   one AssetLoadingSession; the engine then processes sessions ONE at a time, once per frame
+///   (NAssetLoader.cs:68-85), so concurrent producers serialize behind each other.
+/// Owner: BootTimer. First consumer: "preload-engine-sessions-idle" milestone + the per-class
+///   counters in the summary preload_contract line.
+/// Session classes: a session is "optional-warmup" when its name starts with the producer's own
+///   contract prefix "RegentFXFastBoot optional " (peer MainFile.cs:177, construction :1112-1117);
+///   every other session is "engine" (PreloadManager.cs:39-183). An unknown third party therefore
+///   lands in the engine class - the summary lists the distinct engine session names and the reopen
+///   count, so that misclassification is visible instead of silent.
 /// Completion semantics: the Task RETURN is not asynchronous completion. The observer attaches a
 ///   continuation to the returned session Task and records a session only when it reaches a terminal
 ///   state (success, fault or cancellation).
-/// Global completion boundary: NAssetLoader exposes no producer-closed signal. Therefore an
-///   outstanding count of zero is recorded only as a sampled idle point for sessions observed by this
-///   probe. It is never named or logged as global preload completion. A later submission records a
-///   reopened marker and starts a new observed epoch.
+/// Completion boundary: NAssetLoader exposes no producer-closed signal, and the engine reopens its
+///   own queue after the main menu appears (deferred "Common" session, NGame.cs:1040-1041). So the
+///   engine idle latch is first-wins and class-scoped; it is never named or logged as global preload
+///   completion and never as warm-up completion. The warm-up boundary is RegentFXFastBoot's own
+///   terminal (see "warmup-consumer-terminal"). A later submission records a reopened marker and
+///   starts a new observed epoch.
 /// Cleanup point: each continuation holds only its own session until completion; the outstanding
 ///   counter and epoch state are protected by one short StateGate critical section; all state is O(1) apart from the bounded
 ///   BootDiag record store.
@@ -937,9 +968,19 @@ public static class PreloadSubmitPatch
 {
     private const int MaxNameLen = 96;
     private const int MaxProducerNameLen = 64;
+    private const int MaxDistinctEngineNames = 8;
+
+    // Producer-side session-name contract for the optional warm-up class. Documented coupling, not a
+    // guess: RegentFXFastBoot names every optional request "<prefix> <path>" (peer MainFile.cs:177,
+    // :1112-1117). Every other session counts as engine (PreloadManager) work.
+    private const string OptionalWarmUpNamePrefix = "RegentFXFastBoot optional";
+
     private static readonly object StateGate = new();
 
-    // O(1) state only. Counters saturate instead of wrapping; no session collection is retained.
+    // O(1) state only, apart from a bounded list of distinct engine session names. Counters saturate
+    // instead of wrapping; no per-session collection is retained.
+    private static readonly List<string> EngineSessionNames = new();
+    private static long _engineNameOverflow;
     private static long _outstanding;
     private static long _observedSessions;
     private static long _submissionEpoch;
@@ -949,8 +990,8 @@ public static class PreloadSubmitPatch
     private static long _underflowCount;
     private static long _firstSubmitTick;
     private static int _firstSubmitThread;
-    private static long _epochFirstSubmitTick;
-    private static int _epochFirstSubmitThread;
+    private static long _engineFirstSubmitTick;
+    private static int _engineFirstSubmitThread;
     private static long _producerClosedTick;
     private static int _producerClosedThread;
     private static long _lastIdleTick;
@@ -959,7 +1000,23 @@ public static class PreloadSubmitPatch
     private static bool _completionLatched;
     private static bool _contractViolation;
     private static bool _trackingBroken;
-    private static bool _observedIdleMilestoneLatched;
+    private static bool _engineIdleMilestoneLatched;
+
+    // Per-class accounting. "engine" = PreloadManager sessions; "optional" = third-party warm-up
+    // sessions. Each class keeps its own outstanding count so one class can be idle while the other
+    // still works - that separation is the whole point of the renewed contract.
+    private static long _engineSubmitted;
+    private static long _engineCompleted;
+    private static long _engineFailed;
+    private static long _engineOutstanding;
+    private static long _engineIdleEpochs;
+    private static long _engineLastIdleTick;
+    private static long _optionalSubmitted;
+    private static long _optionalCompleted;
+    private static long _optionalFailed;
+    private static long _optionalOutstanding;
+    private static long _optionalIdleEpochs;
+    private static long _optionalLastIdleTick;
     private static bool _reopenMarkerEmitted;
     private static bool _lateSubmissionMarkerEmitted;
     private static bool _trackingFailureMarkerEmitted;
@@ -984,7 +1041,9 @@ public static class PreloadSubmitPatch
 
             long submitTick = Stopwatch.GetTimestamp();
             int submitThread = System.Environment.CurrentManagedThreadId;
-            string sessionName = NormalizeName(SessionName(session), MaxNameLen);
+            string rawName = SessionName(session);
+            bool optional = rawName.StartsWith(OptionalWarmUpNamePrefix, StringComparison.Ordinal);
+            string sessionName = NormalizeName(rawName, MaxNameLen);
             long index;
             long epoch;
             bool reopened;
@@ -1007,8 +1066,6 @@ public static class PreloadSubmitPatch
                     }
 
                     IncrementSaturated(ref _submissionEpoch);
-                    _epochFirstSubmitTick = submitTick;
-                    _epochFirstSubmitThread = submitThread;
                 }
 
                 if (_firstSubmitTick == 0)
@@ -1042,6 +1099,23 @@ public static class PreloadSubmitPatch
                 else
                 {
                     _outstanding++;
+                    if (optional)
+                    {
+                        IncrementSaturated(ref _optionalSubmitted);
+                        IncrementSaturated(ref _optionalOutstanding);
+                    }
+                    else
+                    {
+                        IncrementSaturated(ref _engineSubmitted);
+                        IncrementSaturated(ref _engineOutstanding);
+                        if (_engineFirstSubmitTick == 0)
+                        {
+                            _engineFirstSubmitTick = submitTick;
+                            _engineFirstSubmitThread = submitThread;
+                        }
+
+                        NoteEngineSessionNameLocked(sessionName);
+                    }
                 }
 
                 epoch = _submissionEpoch;
@@ -1051,6 +1125,7 @@ public static class PreloadSubmitPatch
                 "preload-session-submitted",
                 "index=" + index.ToString(CultureInfo.InvariantCulture)
                 + " epoch=" + epoch.ToString(CultureInfo.InvariantCulture)
+                + " class=" + (optional ? "optional" : "engine")
                 + " session=" + sessionName);
 
             if (reopened && TakeReopenMarker())
@@ -1071,7 +1146,7 @@ public static class PreloadSubmitPatch
             try
             {
                 __result.ContinueWith(
-                    t => CompleteSession(t, submitTick, submitThread, index, epoch, sessionName),
+                    t => CompleteSession(t, submitTick, submitThread, index, epoch, sessionName, optional),
                     TaskScheduler.Default);
             }
             catch (Exception e)
@@ -1099,7 +1174,7 @@ public static class PreloadSubmitPatch
     /// Explicit producer fence for a cooperating owner. The caller must own every producer
     /// represented by this observer, call this after BootTimer installation, and guarantee that no
     /// later LoadInTheBackground call is possible. Closure is not inferred from queue state.
-    /// Without this call, only the observed-sessions-idle milestone can be emitted.
+    /// Without this call, only the class-scoped engine idle milestone can be emitted.
     /// </summary>
     public static bool MarkProducerClosed(string producer, string? note = null)
     {
@@ -1205,18 +1280,20 @@ public static class PreloadSubmitPatch
         int submitThread,
         long index,
         long epoch,
-        string sessionName)
+        string sessionName,
+        bool optional)
     {
         try
         {
             long doneTick = Stopwatch.GetTimestamp();
             int doneThread = System.Environment.CurrentManagedThreadId;
+            bool completedOk = task.Status == TaskStatus.RanToCompletion;
             long remaining;
-            bool firstIdle = false;
-            long idleEpoch = 0;
+            bool firstEngineIdle = false;
             long idleStartTick = 0;
             int idleStartThread = 0;
-            long observedAtIdle = 0;
+            long engineIdleEpoch = 0;
+            long engineSubmittedAtIdle = 0;
             bool trackingMarker = false;
             long underflowAtFailure = 0;
             bool completion = false;
@@ -1244,21 +1321,48 @@ public static class PreloadSubmitPatch
                     _outstanding--;
                 }
 
+                // Per-class decrement + outcome. Kept independent of the total counter so a broken
+                // total can never masquerade as class progress, and so one class can be idle while
+                // the other still works (engine "Common" vs the 32 optional warm-up paths).
+                if (optional)
+                {
+                    if (_optionalOutstanding > 0)
+                    {
+                        _optionalOutstanding--;
+                    }
+
+                    if (completedOk)
+                    {
+                        IncrementSaturated(ref _optionalCompleted);
+                    }
+                    else
+                    {
+                        IncrementSaturated(ref _optionalFailed);
+                    }
+                }
+                else
+                {
+                    if (_engineOutstanding > 0)
+                    {
+                        _engineOutstanding--;
+                    }
+
+                    if (completedOk)
+                    {
+                        IncrementSaturated(ref _engineCompleted);
+                    }
+                    else
+                    {
+                        IncrementSaturated(ref _engineFailed);
+                    }
+                }
+
                 remaining = _outstanding;
                 if (remaining == 0 && !_trackingBroken)
                 {
-                    idleEpoch = IncrementSaturated(ref _idleEpochs);
+                    IncrementSaturated(ref _idleEpochs);
                     _lastIdleTick = doneTick;
                     _lastIdleThread = doneThread;
-                    idleStartTick = _epochFirstSubmitTick != 0 ? _epochFirstSubmitTick : submitTick;
-                    idleStartThread = _epochFirstSubmitThread != 0 ? _epochFirstSubmitThread : submitThread;
-                    observedAtIdle = _observedSessions;
-                    if (!_observedIdleMilestoneLatched)
-                    {
-                        _observedIdleMilestoneLatched = true;
-                        firstIdle = true;
-                    }
-
                     completion = TryTakeCompletionLocked(
                         doneTick,
                         doneThread,
@@ -1266,9 +1370,31 @@ public static class PreloadSubmitPatch
                         out completionStartThread,
                         out completionNote);
                 }
+
+                if (optional)
+                {
+                    if (_optionalOutstanding == 0 && _optionalSubmitted > 0)
+                    {
+                        IncrementSaturated(ref _optionalIdleEpochs);
+                        _optionalLastIdleTick = doneTick;
+                    }
+                }
+                else if (_engineOutstanding == 0 && _engineSubmitted > 0)
+                {
+                    IncrementSaturated(ref _engineIdleEpochs);
+                    _engineLastIdleTick = doneTick;
+                    if (!_engineIdleMilestoneLatched)
+                    {
+                        _engineIdleMilestoneLatched = true;
+                        firstEngineIdle = true;
+                        idleStartTick = _engineFirstSubmitTick != 0 ? _engineFirstSubmitTick : submitTick;
+                        idleStartThread = _engineFirstSubmitThread != 0 ? _engineFirstSubmitThread : submitThread;
+                        engineIdleEpoch = _engineIdleEpochs;
+                        engineSubmittedAtIdle = _engineSubmitted;
+                    }
+                }
             }
 
-            bool completedOk = task.Status == TaskStatus.RanToCompletion;
             Exception? err = task.IsFaulted ? task.Exception?.GetBaseException() : null;
             BootDiag.RecordSpan(
                 "preload-session",
@@ -1280,6 +1406,7 @@ public static class PreloadSubmitPatch
                 err,
                 "index=" + index.ToString(CultureInfo.InvariantCulture)
                 + " epoch=" + epoch.ToString(CultureInfo.InvariantCulture)
+                + " class=" + (optional ? "optional" : "engine")
                 + " session=" + sessionName
                 + " task_status=" + task.Status
                 + " remaining=" + remaining.ToString(CultureInfo.InvariantCulture),
@@ -1293,14 +1420,14 @@ public static class PreloadSubmitPatch
                     "underflow=" + underflowAtFailure.ToString(CultureInfo.InvariantCulture));
             }
 
-            if (firstIdle)
+            if (firstEngineIdle)
             {
                 string idleNote =
-                    "idle_epoch=" + idleEpoch.ToString(CultureInfo.InvariantCulture)
-                    + "; observed_sessions=" + observedAtIdle.ToString(CultureInfo.InvariantCulture)
-                    + "; terminal_tasks_only=true; producer_close_not_observed";
+                    "engine_sessions=" + engineSubmittedAtIdle.ToString(CultureInfo.InvariantCulture)
+                    + "; engine_idle_epoch=" + engineIdleEpoch.ToString(CultureInfo.InvariantCulture)
+                    + "; terminal_tasks_only=true";
                 BootDiag.RecordSpan(
-                    "preload-observed-sessions",
+                    "preload-engine-sessions",
                     "span",
                     null,
                     idleStartTick,
@@ -1310,14 +1437,13 @@ public static class PreloadSubmitPatch
                     idleNote,
                     idleStartThread);
                 BootDiag.LatchMilestone(
-                    "preload-observed-sessions-idle",
+                    "preload-engine-sessions-idle",
                     null,
                     idleStartTick,
                     doneTick,
                     true,
                     null,
-                    "observed sessions reached terminal Task state; this is a snapshot, not global preload completion"
-                    + "; idle_epoch=" + idleEpoch.ToString(CultureInfo.InvariantCulture),
+                    "engine session class only; engine reopens after the menu; not warm-up completion",
                     idleStartThread);
             }
 
@@ -1411,7 +1537,39 @@ public static class PreloadSubmitPatch
                    + " completion_latched=" + BoolString(_completionLatched)
                    + " last_idle_tick=" + _lastIdleTick.ToString(CultureInfo.InvariantCulture)
                    + " last_idle_thread=" + _lastIdleThread.ToString(CultureInfo.InvariantCulture)
-                   + " note=\"observed idle is a snapshot; closed-and-idle requires an explicit producer fence\"";
+                   + " classifier=\"session name starts with '" + OptionalWarmUpNamePrefix + "' => optional-warmup, else engine\""
+                   + " engine_submitted=" + _engineSubmitted.ToString(CultureInfo.InvariantCulture)
+                   + " engine_completed=" + _engineCompleted.ToString(CultureInfo.InvariantCulture)
+                   + " engine_failed=" + _engineFailed.ToString(CultureInfo.InvariantCulture)
+                   + " engine_outstanding=" + _engineOutstanding.ToString(CultureInfo.InvariantCulture)
+                   + " engine_idle_epochs=" + _engineIdleEpochs.ToString(CultureInfo.InvariantCulture)
+                   + " engine_last_idle_tick=" + _engineLastIdleTick.ToString(CultureInfo.InvariantCulture)
+                   + " engine_names=\"" + string.Join(",", EngineSessionNames) + "\""
+                   + " engine_name_overflow=" + _engineNameOverflow.ToString(CultureInfo.InvariantCulture)
+                   + " optional_submitted=" + _optionalSubmitted.ToString(CultureInfo.InvariantCulture)
+                   + " optional_completed=" + _optionalCompleted.ToString(CultureInfo.InvariantCulture)
+                   + " optional_failed=" + _optionalFailed.ToString(CultureInfo.InvariantCulture)
+                   + " optional_outstanding=" + _optionalOutstanding.ToString(CultureInfo.InvariantCulture)
+                   + " optional_idle_epochs=" + _optionalIdleEpochs.ToString(CultureInfo.InvariantCulture)
+                   + " optional_last_idle_tick=" + _optionalLastIdleTick.ToString(CultureInfo.InvariantCulture)
+                   + " semantics=\"engine idle: first-wins snapshot of the engine class only, the engine reopens after the menu (NGame.cs:1040-1041); warm-up completion: warmup-consumer-terminal (RegentFXFastBoot CompleteWarmUp); a per-path optional producer is never idle-terminal between paths, so optional_idle_epochs is a count of quiet moments, not a completion claim; closed-and-idle requires an explicit producer fence\"";
+        }
+    }
+
+    private static void NoteEngineSessionNameLocked(string sessionName)
+    {
+        if (EngineSessionNames.Contains(sessionName))
+        {
+            return;
+        }
+
+        if (EngineSessionNames.Count < MaxDistinctEngineNames)
+        {
+            EngineSessionNames.Add(sessionName);
+        }
+        else
+        {
+            _engineNameOverflow++;
         }
     }
 
@@ -1696,6 +1854,314 @@ internal static class RegentFxBinder
         catch (Exception e)
         {
             return "unknown(reason=" + BootDiag.SummarizeException(e) + ")";
+        }
+    }
+}
+
+/// <summary>
+/// Reflection binder for the RegentFXFastBoot warm-up terminal - the consumer whose completion the
+/// "first preload queue drained" observation used to be compared against.
+///
+/// Why a separate binder: BootTimer's RegentFX pass is terminal after ONE complete binding pass
+/// (`RegentFxBinder._terminal`), and the first such pass normally runs when RegentFX's own
+/// TryLoadMod finishes - before the FastBoot assembly exists in the load order. This binder keeps
+/// its own attempt budget and terminal flag so the warm-up terminal can still be bound later, at
+/// FastBoot's TryLoadMod or at main-menu-visible.
+///
+/// Contract (peer source, verified by reading it):
+///  - assembly name "RegentFXFastBoot" (shipped payload RegentFXFastBoot.dll; a contains-match is
+///    used as a versioning fallback), type
+///    "RegentFXFastBoot.RegentFXFastBootCode.MainFile" (MainFile.cs:15, :155).
+///  - terminal method: the private instance `void CompleteWarmUp(string reason)`
+///    (MainFile.cs:1233-1240); it is the ONE place optional work ends, and it reports
+///    warmed/alreadyCached/failed/notSubmitted. Every field it reports from is static
+///    (`_warmed`, `_alreadyCached`, `Pending`, `FailedPaths`, `_phase`), so the prefix reads them
+///    without touching the instance.
+///  - a shape change (different signature/return type) is treated as unsupported: the terminal
+///    milestone then stays unobserved with a recorded reason, never zero.
+///
+/// Producer: RegentFXFastBoot's warmer node. Owner: BootTimer. First consumer:
+///   "warmup-consumer-terminal" milestone + the summary hooks line. Cleanup point: process-lifetime
+///   patch, removed with the mod; the hook body allocates nothing on any hot path (it fires at most
+///   once per launch).
+/// </summary>
+internal static class FastBootBinder
+{
+    private const int MaxAttempts = 6;
+    private const string FastBootAssemblyName = "RegentFXFastBoot";
+    private const string WarmUpTypeName = "RegentFXFastBoot.RegentFXFastBootCode.MainFile";
+    private const string TerminalMethodName = "CompleteWarmUp";
+
+    private static int _attempts;
+    private static bool _terminal;
+    private static Type? _warmUpType;
+    private static FieldInfo? _phaseField;
+    private static FieldInfo? _warmedField;
+    private static FieldInfo? _alreadyCachedField;
+    private static FieldInfo? _pendingField;
+    private static FieldInfo? _failedPathsField;
+    private static FieldInfo? _collectorFailureField;
+
+    internal static void TryBind(Harmony harmony, string trigger)
+    {
+        if (_terminal || !BootDiag.Enabled)
+        {
+            return;
+        }
+
+        if (Interlocked.Increment(ref _attempts) > MaxAttempts)
+        {
+            _terminal = true;
+            BootDiag.SetHookState("fastboot_binding", "scan cap reached without the FastBoot assembly");
+            return;
+        }
+
+        BootDiag.SetHookState("fastboot_binding_attempts", _attempts.ToString(CultureInfo.InvariantCulture));
+        try
+        {
+            Bind(harmony, trigger);
+        }
+        catch (Exception e)
+        {
+            _terminal = true;
+            BootDiag.SetHookState("fastboot_binding", "exception: " + BootDiag.SummarizeException(e));
+            BootDiag.RecordFailure("fastboot-binding", e, "trigger=" + trigger);
+        }
+    }
+
+    private static void Bind(Harmony harmony, string trigger)
+    {
+        // Exact assembly name first (the shipped payload is RegentFXFastBoot.dll), then a
+        // contains-match as a versioning fallback: "RegentFX" never contains "RegentFXFastBoot",
+        // so this cannot pick up the RegentFX assembly. The type-name check below is the real guard.
+        Assembly? assembly = null;
+        Assembly? loose = null;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = asm.GetName().Name;
+            if (name == null)
+            {
+                continue;
+            }
+
+            if (string.Equals(name, FastBootAssemblyName, StringComparison.Ordinal))
+            {
+                assembly = asm;
+                break;
+            }
+
+            if (loose == null && name.Contains(FastBootAssemblyName, StringComparison.Ordinal))
+            {
+                loose = asm;
+            }
+        }
+
+        assembly ??= loose;
+        if (assembly == null)
+        {
+            // Not terminal: a later trigger runs after FastBoot actually loads.
+            BootDiag.SetHookState("fastboot_binding", "assembly not loaded yet");
+            return;
+        }
+
+        _warmUpType = assembly.GetType(WarmUpTypeName);
+        if (_warmUpType == null)
+        {
+            _terminal = true;
+            BootDiag.SetHookState("fastboot_binding", "type " + WarmUpTypeName + " not found (FastBoot version changed)");
+            return;
+        }
+
+        var terminal = _warmUpType.GetMethod(
+            TerminalMethodName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly,
+            binder: null,
+            types: new[] { typeof(string) },
+            modifiers: null);
+        if (terminal == null || terminal.ReturnType != typeof(void))
+        {
+            _terminal = true;
+            BootDiag.SetHookState(
+                "fastboot_binding",
+                "CompleteWarmUp does not match the expected instance void (string) shape; the warm-up terminal stays unobserved");
+            return;
+        }
+
+        var prefixMethod = AccessTools.Method(typeof(FastBootHooks), nameof(FastBootHooks.TerminalPrefix));
+        if (prefixMethod == null)
+        {
+            _terminal = true;
+            BootDiag.SetHookState("fastboot_binding", "hook body method missing in BootTimer itself");
+            return;
+        }
+
+        try
+        {
+            // Priority left at the default: this prefix observes, it never suppresses.
+            harmony.Patch(terminal, prefix: new HarmonyMethod(prefixMethod));
+        }
+        catch (Exception e)
+        {
+            _terminal = true;
+            BootDiag.SetHookState("fastboot_binding", "patch failed: " + BootDiag.SummarizeException(e));
+            return;
+        }
+
+        _phaseField = Field("_phase");
+        _warmedField = Field("_warmed");
+        _alreadyCachedField = Field("_alreadyCached");
+        _pendingField = Field("Pending");
+        _failedPathsField = Field("FailedPaths");
+        _collectorFailureField = InstanceField("_collectionFailureReason");
+        _terminal = true;
+        BootDiag.SetHookState("fastboot_binding", "bound (trigger=" + trigger + ")");
+        BootDiag.SetHookState("fastboot_terminal_hook", "MainFile.CompleteWarmUp(string)");
+    }
+
+    private static FieldInfo? Field(string name)
+    {
+        try
+        {
+            return _warmUpType?.GetField(
+                name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static FieldInfo? InstanceField(string name)
+    {
+        try
+        {
+            return _warmUpType?.GetField(
+                name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Bounded note for the "warmup-consumer-terminal" milestone: the producer's own terminal
+    /// reason plus the counts its COMPLETED log line reports. Reflection only; never throws.
+    /// </summary>
+    internal static string TerminalNote(object? instance, string? reason)
+    {
+        try
+        {
+            return "reason=" + (reason ?? "unavailable")
+                   + "; warmed=" + Count(_warmedField)
+                   + "; already_cached=" + Count(_alreadyCachedField)
+                   + "; failed=" + FailedCount(instance)
+                   + "; pending=" + Count(_pendingField);
+        }
+        catch
+        {
+            return "reason=" + (reason ?? "unavailable") + "; counts unavailable (reflection)";
+        }
+    }
+
+    private static string FailedCount(object? instance)
+    {
+        string failed = Count(_failedPathsField);
+        try
+        {
+            return _collectorFailureField?.GetValue(instance) != null ? failed + "+1collector" : failed;
+        }
+        catch
+        {
+            return failed;
+        }
+    }
+
+    private static string Count(FieldInfo? field)
+    {
+        try
+        {
+            if (field == null)
+            {
+                return "unknown";
+            }
+
+            var value = field.GetValue(null);
+            return value switch
+            {
+                null => "unknown",
+                int i => i.ToString(CultureInfo.InvariantCulture),
+                System.Collections.ICollection c => c.Count.ToString(CultureInfo.InvariantCulture),
+                _ => "unknown",
+            };
+        }
+        catch
+        {
+            return "unknown";
+        }
+    }
+
+    /// <summary>
+    /// Live warm-up state at summary time: the producer's phase plus its remaining queue. This is
+    /// how a reader tells "the warm-up is still submitting" from "the warm-up ended" without
+    /// guessing from the preload session counters.
+    /// </summary>
+    internal static string StateString()
+    {
+        if (_warmUpType == null)
+        {
+            return "unknown(reason=FastBoot warm-up type not resolved)";
+        }
+
+        try
+        {
+            var phase = _phaseField?.GetValue(null);
+            return "phase=" + (phase?.ToString() ?? "unknown")
+                   + " pending=" + Count(_pendingField)
+                   + " warmed=" + Count(_warmedField)
+                   + " terminal_hook=" + (BootDiag.HookState("fastboot_terminal_hook") ?? "unbound");
+        }
+        catch (Exception e)
+        {
+            return "unknown(reason=" + BootDiag.SummarizeException(e) + ")";
+        }
+    }
+}
+
+/// <summary>
+/// Hook methods for the reflection-bound RegentFXFastBoot terminal.
+///
+/// Producer: RegentFXFastBoot's warmer node (`CompleteWarmUp`). Owner: BootTimer. First consumer:
+///   the "warmup-consumer-terminal" milestone. Cleanup point: removed with the mod; no per-frame work.
+/// Failure awareness: exception-proof body; the prefix cannot change the original outcome, and the
+///   milestone is latched only when the producer's own terminal actually ran.
+/// </summary>
+internal static class FastBootHooks
+{
+    // Prefix on RegentFXFastBoot MainFile.CompleteWarmUp(string reason). No __state: the milestone is
+    // latched here, at the producer's own terminal tick, and cannot be widened by later frames.
+    internal static void TerminalPrefix(object? __instance, string? reason)
+    {
+        try
+        {
+            long now = Stopwatch.GetTimestamp();
+            BootDiag.LatchMilestone(
+                "warmup-consumer-terminal",
+                null,
+                now,
+                now,
+                true,
+                null,
+                FastBootBinder.TerminalNote(__instance, reason),
+                null);
+            // The main-menu summary usually runs before the warm-up drains (smokeA 2026-10-27:
+            // menu 18:13:21, terminal 18:13:30), so it reports this milestone as observed=false.
+            // Write one more bounded summary here so the block that carries the terminal exists.
+            BootDiag.WriteSummary("warmup-consumer-terminal");
+        }
+        catch (Exception e)
+        {
+            BootDiag.RecordFailure("fastboot-terminal-hook-failed", e, null);
         }
     }
 }
