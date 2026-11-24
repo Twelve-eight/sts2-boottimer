@@ -2,4 +2,9 @@
 mono/
 **/obj/
 **/bin/
+.tmp/
+workshop/content/
 *.pck
+*.dll
+*.pdb
+*.sha256

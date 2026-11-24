@@ -179,7 +179,7 @@ internal static class BootDiag
         ("main-menu-visible", "main menu was not reached by summary time"),
         ("preload-engine-sessions-idle", "no observed non-optional (PreloadManager) session drained after the observer installed; a snapshot of that one class, never a boot-loading claim"),
         ("warmup-consumer-terminal", "RegentFXFastBoot's CompleteWarmUp was not observed by summary time (FastBoot absent, hook not bound, the warm-up never reached a terminal, or no warm-up was scheduled this launch - see the hooks line)"),
-        ("preload-producer-closed-and-idle", "no explicit producer close fence was observed; observed session idleness is not global completion"),
+        ("preload-producer-closed-and-idle", "no valid closed-and-idle observation: producer fence absent, sessions outstanding, or accounting invalid; see preload_contract"),
         ("first-effect-scene-load", "no lazy engine-cache fetch (AssetCache.GetScene/GetAsset) inside a RegentFX invocation context was observed; with a working preload the per-scene load cost is folded into the regentfx-loadscenes span"),
         ("first-effect-instantiate", "no node instantiation via the non-generic GenVFXNode(string) overload was observed; generic GenVFXNode<T> callers cannot be patched (open generic) - see hooks line"),
         ("first-combat-room-ready", "no NCombatRoom became ready by summary time"),
@@ -953,6 +953,8 @@ internal static class CombatRoomReadyPatch
 /// Completion semantics: the Task RETURN is not asynchronous completion. The observer attaches a
 ///   continuation to the returned session Task and records a session only when it reaches a terminal
 ///   state (success, fault or cancellation).
+///   Completion and close-fence ticks are captured under StateGate with their accounting changes:
+///   they measure when the observer certifies that state, not the task's earlier scheduler transition.
 /// Completion boundary: NAssetLoader exposes no producer-closed signal, and the engine reopens its
 ///   own queue after the main menu appears (deferred "Common" session, NGame.cs:1040-1041). So the
 ///   engine idle latch is first-wins and class-scoped; it is never named or logged as global preload
@@ -1029,6 +1031,13 @@ public static class PreloadSubmitPatch
         {
             if (__exception != null)
             {
+                // The engine enqueues before SetProcess can throw. No returned task means its
+                // completion is untracked, so a later close fence must not certify an idle queue.
+                lock (StateGate)
+                {
+                    _trackingBroken = true;
+                    _contractViolation = true;
+                }
                 BootDiag.RecordFailure("preload-submit", __exception, "session=" + SessionName(session));
                 return;
             }
@@ -1172,8 +1181,10 @@ public static class PreloadSubmitPatch
 
     /// <summary>
     /// Explicit producer fence for a cooperating owner. The caller must own every producer
-    /// represented by this observer, call this after BootTimer installation, and guarantee that no
-    /// later LoadInTheBackground call is possible. Closure is not inferred from queue state.
+    /// represented by this observer, call this after BootTimer installation, and guarantee that
+    /// every earlier LoadInTheBackground call, including its observer finalizer, has returned, and no
+    /// later call is possible. Closure is not inferred from queue state. A later contract violation
+    /// invalidates any previously emitted closed-and-idle snapshot.
     /// Without this call, only the class-scoped engine idle milestone can be emitted.
     /// </summary>
     public static bool MarkProducerClosed(string producer, string? note = null)
@@ -1193,7 +1204,7 @@ public static class PreloadSubmitPatch
         }
 
         string producerName = NormalizeName(producer, MaxProducerNameLen);
-        long closeTick = Stopwatch.GetTimestamp();
+        long closeTick;
         int closeThread = System.Environment.CurrentManagedThreadId;
         bool accepted = false;
         bool conflict = false;
@@ -1208,6 +1219,7 @@ public static class PreloadSubmitPatch
 
         lock (StateGate)
         {
+            closeTick = Stopwatch.GetTimestamp();
             if (_producerClosed)
             {
                 firstProducerName = _producerName;
@@ -1285,7 +1297,7 @@ public static class PreloadSubmitPatch
     {
         try
         {
-            long doneTick = Stopwatch.GetTimestamp();
+            long doneTick;
             int doneThread = System.Environment.CurrentManagedThreadId;
             bool completedOk = task.Status == TaskStatus.RanToCompletion;
             long remaining;
@@ -1303,6 +1315,7 @@ public static class PreloadSubmitPatch
 
             lock (StateGate)
             {
+                doneTick = Stopwatch.GetTimestamp();
                 if (_outstanding <= 0)
                 {
                     IncrementSaturated(ref _underflowCount);
@@ -1373,13 +1386,13 @@ public static class PreloadSubmitPatch
 
                 if (optional)
                 {
-                    if (_optionalOutstanding == 0 && _optionalSubmitted > 0)
+                    if (!_trackingBroken && _optionalOutstanding == 0 && _optionalSubmitted > 0)
                     {
                         IncrementSaturated(ref _optionalIdleEpochs);
                         _optionalLastIdleTick = doneTick;
                     }
                 }
-                else if (_engineOutstanding == 0 && _engineSubmitted > 0)
+                else if (!_trackingBroken && _engineOutstanding == 0 && _engineSubmitted > 0)
                 {
                     IncrementSaturated(ref _engineIdleEpochs);
                     _engineLastIdleTick = doneTick;

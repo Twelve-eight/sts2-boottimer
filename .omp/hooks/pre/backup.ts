@@ -50,14 +50,24 @@ export default function backupHook(pi: HookAPI): void {
       for (const repo of repos) {
         const status = await pi.exec("git", ["-C", repo, "status", "--porcelain"]);
         if (status.code !== 0 || !status.stdout.trim()) continue;
-        await pi.exec("git", ["-C", repo, "add", "-A"]);
-        await pi.exec("git", [
+        // AGENTS.md §7 requires `git add -A` here, so the snapshot covers the whole
+        // tree. Only the exit-code checks below are new: a failing add/commit used to
+        // be dropped, leaving the tree dirty with no record anywhere.
+        const added = await pi.exec("git", ["-C", repo, "add", "-A"]);
+        if (added.code !== 0) {
+          pi.logger?.error?.(`[backup hook] git add failed in ${repo}: ${added.stderr || added.stdout}`);
+          continue;
+        }
+        const committed = await pi.exec("git", [
           "-C",
           repo,
           "commit",
           "-m",
           `snapshot after ${event.toolName} (${new Date().toISOString()})`,
         ]);
+        if (committed.code !== 0) {
+          pi.logger?.error?.(`[backup hook] git commit failed in ${repo}: ${committed.stderr || committed.stdout}`);
+        }
       }
     } catch (err) {
       // 静默：hook 失败绝不影响工具执行与结果。

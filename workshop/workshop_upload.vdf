@@ -1,0 +1,23 @@
+"workshopitem"
+{
+	"appid"		"2868840"
+	"contentfolder"		"G:\\omp works\\Sts\\sts2-boottimer\\workshop\\content"
+	"previewfile"		"G:\\omp works\\Sts\\sts2-boottimer\\workshop\\preview.png"
+	"visibility"		"0"
+	"title"		"BootTimer (启动耗时与加载里程碑诊断工具)"
+	"description"		"[h1]BootTimer[/h1]
+
+纯观测型诊断模组: 在 [code]godot.log[/code] 中用单调时钟高精度记录各个模组加载耗时、本地化合并、引擎预热会话与主菜单可见里程碑, 用于排查启动卡顿, 不修改任何游戏逻辑或存档.
+[i]Diagnostic-only observer that logs monotonic Stopwatch boot milestones and per-mod load spans to godot.log without mutating gameplay or saves.[/i]
+
+[hr]
+
+[h2]特性 / Features[/h2]
+
+[list]
+[*]零游戏玩法改动, 不注册任何卡牌、遗物、药水、事件或角色
+[*]记录 [code]TryLoadMod[/code]、[code]preload-session[/code]、[code]main-menu-visible[/code] 及 [code]RegentFXFastBoot[/code] 预热状态摘要 ([code]sts-performance-v1[/code])
+[*]仅当环境变量 [code]BOOTTIMER_DIAG[/code] 严格设为 0 或 false 时关闭, 默认开启; 诊断完成后可直接禁用或取消订阅
+[/list]"
+	"changenote"		"v0.2.0: 首次公开工坊发布, 适配 v0.113.1."
+}

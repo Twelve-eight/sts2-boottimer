@@ -1,7 +1,18 @@
 <Project>
     <!--
       Fills Sts2Path and Sts2DataDir when not set (e.g. no local.props).
-      Override via local.props or MSBuild /p:Sts2Path=...
+      Override via local.props or MSBuild /p:Sts2Path=..
+
+      2026-09-17 HARD RULE (AGENTS.md Sec 2b): the TEST copy is the target for every build.
+      The user plays on the Steam install, so a build that silently deploys there is a
+      regression in their game. Discovery therefore:
+        1. prefers $(Sts2TestPath) / the E: test copy / the B: test copy, in that order;
+        2. REFUSES to fall back to a Steam library - it errors instead, so a misconfigured
+           machine fails loudly at build time rather than quietly overwriting the user's game.
+
+      Why this order: the old chain tried the Steam registry key and the Steam library FIRST,
+      which is exactly how builds ended up in the Steam install. Deploying to the Steam copy is
+      now never the default; pass /p:Sts2Path=... explicitly if you truly mean to.
     -->
     <!-- OS Detection -->
     <PropertyGroup>
@@ -13,24 +24,19 @@
 
     <!-- Default -->
     <PropertyGroup Condition="'$(IsLinux)' != 'true' And '$(IsOSX)' != 'true'">
-        <!-- Try getting uninstall location first -->
-        <RegistrySts2Path>$([MSBuild]::GetRegistryValueFromView('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 2868840', 'InstallLocation', '', RegistryView.Registry64, RegistryView.Registry32))</RegistrySts2Path>
-        <AutoSteamPath>$(registry:HKEY_CURRENT_USER\Software\Valve\Steam@SteamPath)\steamapps</AutoSteamPath>
-        <SteamLibraryPath Condition="'$(SteamLibraryPath)' == '' and Exists('$(AutoSteamPath)/common/Slay the Spire 2')">$(AutoSteamPath)</SteamLibraryPath>
-        <SteamLibraryPath Condition="'$(SteamLibraryPath)' == ''">C:/Program Files (x86)/Steam/steamapps</SteamLibraryPath>
+        <!-- Test copies, in preference order. Sts2TestPath wins if the caller set it. -->
+        <Sts2Path Condition="'$(Sts2Path)' == '' and '$(Sts2TestPath)' != '' and Exists('$(Sts2TestPath)/data_sts2_windows_x86_64')">$(Sts2TestPath)</Sts2Path>
+        <Sts2Path Condition="'$(Sts2Path)' == '' and Exists('E:/Slay the Spire 2/data_sts2_windows_x86_64')">E:/Slay the Spire 2</Sts2Path>
+        <Sts2Path Condition="'$(Sts2Path)' == '' and Exists('G:/omp works/Sts/_runtime/sts2-test-client-B/data_sts2_windows_x86_64')">G:/omp works/Sts/_runtime/sts2-test-client-B</Sts2Path>
 
-        <Sts2Path Condition="'$(Sts2Path)' == '' and Exists('$(SteamLibraryPath)/common/Slay the Spire 2')">$(SteamLibraryPath)/common/Slay the Spire 2</Sts2Path>
-        <Sts2Path Condition="'$(Sts2Path)' == '' and Exists('$(RegistrySts2Path)/data_sts2_windows_x86_64')">$(RegistrySts2Path)</Sts2Path>
-        <Sts2Path Condition="'$(Sts2Path)' == ''">$(SteamLibraryPath)/common/Slay the Spire 2</Sts2Path>
-
+        <!-- Explicit override still wins; otherwise no Steam fallback (see header). -->
         <ModsPath>$(Sts2Path)/mods/</ModsPath>
         <Sts2DataDir>$(Sts2Path)/data_sts2_windows_x86_64</Sts2DataDir>
     </PropertyGroup>
 
     <!-- Linux -->
     <PropertyGroup Condition="'$(IsLinux)' == 'true'">
-        <SteamLibraryPath Condition="'$(SteamLibraryPath)' == ''">$(HOME)/.local/share/Steam/steamapps</SteamLibraryPath>
-        <Sts2Path Condition="'$(Sts2Path)' == ''">$(SteamLibraryPath)/common/Slay the Spire 2</Sts2Path>
+        <Sts2Path Condition="'$(Sts2Path)' == '' and '$(Sts2TestPath)' != ''">$(Sts2TestPath)</Sts2Path>
 
         <ModsPath>$(Sts2Path)/mods/</ModsPath>
         <Sts2DataDir>$(Sts2Path)/data_sts2_linuxbsd_x86_64</Sts2DataDir>
@@ -38,8 +44,7 @@
 
     <!-- macOS -->
     <PropertyGroup Condition="'$(IsOSX)' == 'true'">
-        <SteamLibraryPath Condition="'$(SteamLibraryPath)' == ''">$(HOME)/Library/Application Support/Steam/steamapps</SteamLibraryPath>
-        <Sts2Path Condition="'$(Sts2Path)' == ''">$(SteamLibraryPath)/common/Slay the Spire 2</Sts2Path>
+        <Sts2Path Condition="'$(Sts2Path)' == '' and '$(Sts2TestPath)' != ''">$(Sts2TestPath)</Sts2Path>
 
         <ModsPath>$(Sts2Path)/SlayTheSpire2.app/Contents/MacOS/mods/</ModsPath>
         <Sts2DataDir>$(Sts2Path)/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_x86_64</Sts2DataDir>
