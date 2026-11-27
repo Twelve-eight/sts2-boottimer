@@ -19,5 +19,5 @@
 [*]记录 [code]TryLoadMod[/code]、[code]preload-session[/code]、[code]main-menu-visible[/code] 及 [code]RegentFXFastBoot[/code] 预热状态摘要 ([code]sts-performance-v1[/code])
 [*]仅当环境变量 [code]BOOTTIMER_DIAG[/code] 严格设为 0 或 false 时关闭, 默认开启; 诊断完成后可直接禁用或取消订阅
 [/list]"
-	"changenote"		"v0.2.0: 首次公开工坊发布, 适配 v0.113.1."
+	"changenote"		"v0.2.0: 首次公开工坊发布, 适配 v0.114.0."
 }
