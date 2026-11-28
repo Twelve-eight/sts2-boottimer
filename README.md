@@ -1,6 +1,6 @@
 # BootTimer（启动耗时与加载里程碑诊断工具）
 
-纯只读观测型诊断模组：使用单调时钟（`Stopwatch`）在 `godot.log` 中记录《杀戮尖塔 2》各模组加载耗时、本地化合并、引擎预热会话与主菜单可见里程碑，用于排查启动卡顿；不修改任何游戏玩法、逻辑或存档。
+纯只读观测型诊断模组：使用单调时钟（`Stopwatch`）在游戏日志 `godot.log`（Windows 默认路径 `%APPDATA%\SlayTheSpire2\logs\godot.log`）中记录《杀戮尖塔 2》各模组加载耗时、本地化合并、引擎预热会话与主菜单可见里程碑，用于排查启动卡顿；不修改任何游戏玩法、逻辑或存档。
 
 > **English**: Diagnostic-only observer that logs monotonic boot milestones and per-mod load timings (`TryLoadMod`, localization, preload sessions, `main-menu-visible`, `sts-performance-v1`) to `godot.log` without mutating gameplay or saves.
 
@@ -17,9 +17,11 @@
 ## 安装 / Installation
 
 - **创意工坊**：订阅 [BootTimer](https://steamcommunity.com/sharedfiles/filedetails/?id=3846650308)。
-- **手动安装**：从本仓库 [Releases](https://github.com/Twelve-eight/sts2-boottimer/releases) 下载压缩包，解压至 `<Slay the Spire 2>/mods/`，得到 `mods/BootTimer/{BootTimer.dll,BootTimer.json}`。
+- **手动安装**：从本仓库 [Releases](https://github.com/Twelve-eight/sts2-boottimer/releases) 下载压缩包，解压至 `<Slay the Spire 2>/mods/`，得到 `mods/BootTimer/{BootTimer.dll,BootTimer.json}`（**请勿**同时启用工坊版与手动本地版）。
 
 ## 从源码构建 / Building from source
+
+前置要求：**.NET 9 SDK** 与已安装的《杀戮尖塔 2》。
 
 ```bash
 dotnet build mod/BootTimer.csproj -c Release \
@@ -27,4 +29,4 @@ dotnet build mod/BootTimer.csproj -c Release \
   -p:CopyToModsFolderOnBuild=false
 ```
 
-使用指南与事件字段说明见 [START-HERE.md](START-HERE.md)。
+构建产物位于 `mod/.godot/mono/temp/bin/Release/BootTimer.dll`（配合 `mod/BootTimer.json`）。使用指南与事件字段说明见 [START-HERE.md](START-HERE.md)。
